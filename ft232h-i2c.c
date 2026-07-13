@@ -12,6 +12,10 @@
 #define FT232H_VID 0x0403
 #define FT232H_PID 0x6014
 
+static unsigned int speed = 100000;
+module_param(speed, uint, 0444);
+MODULE_PARM_DESC(speed, "I2C bus speed in Hz (default 100000; e.g. 400000)");
+
 struct ft232h_i2c {
 	struct usb_device   *udev;
 	struct usb_interface *intf;
@@ -39,6 +43,7 @@ struct ft232h_i2c {
 
 /* MPSSE opcodes */
 #define MPSSE_SET_LOW_BYTE    0x80  /* +value +direction */
+#define MPSSE_READ_LOW_BYTE   0x81  /* returns 1 byte: ADBUS pin states */
 #define MPSSE_BYTES_OUT_NEG   0x11  /* MSB first, out on falling edge */
 #define MPSSE_BYTES_IN_POS    0x20  /* MSB first, in on rising edge */
 #define MPSSE_BITS_OUT_NEG    0x13  /* MSB first, out on falling edge */
@@ -305,6 +310,26 @@ static int mpsse_init(struct ft232h_i2c *priv, u32 speed_hz)
 
 	dev_info(&priv->intf->dev, "MPSSE synced, I2C clock %u Hz (div=%u)\n",
 		 speed_hz, div);
+
+	/* Bus health: SCL (AD0) and SDA-in (AD2) should idle high via pull-ups. */
+	{
+		u8 rd[] = { MPSSE_READ_LOW_BYTE, MPSSE_SEND_IMMEDIATE };
+		u8 pins = 0;
+
+		ret = ftdi_write(priv, rd, sizeof(rd));
+		if (ret)
+			return ret;
+		ret = ftdi_read(priv, &pins, 1);
+		if (ret)
+			return ret;
+		if (!(pins & PIN_SCL) || !(pins & PIN_SDAI))
+			dev_warn(&priv->intf->dev,
+				 "I2C lines not idle-high (pins=0x%02x); check pull-ups and AD1=AD2 wiring\n",
+				 pins);
+		else
+			dev_info(&priv->intf->dev,
+				 "I2C bus idle OK (pins=0x%02x)\n", pins);
+	}
 	return 0;
 }
 
@@ -347,7 +372,7 @@ static int ft232h_i2c_probe(struct usb_interface *intf,
 		 "FT232H bound: ep_in=0x%02x ep_out=0x%02x maxpacket=%d index=%u\n",
 		 priv->ep_in, priv->ep_out, priv->maxpacket, priv->index);
 
-	ret = mpsse_init(priv, 100000);
+	ret = mpsse_init(priv, speed);
 	if (ret) {
 		usb_put_dev(priv->udev);
 		return ret;
