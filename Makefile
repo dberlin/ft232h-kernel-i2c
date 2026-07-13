@@ -7,5 +7,11 @@ PWD  := $(shell pwd)
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
+modules_install install:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
+	depmod -a
+
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+.PHONY: all modules_install install clean
