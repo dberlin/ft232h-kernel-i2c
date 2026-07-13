@@ -110,6 +110,143 @@ static int ftdi_read(struct ft232h_i2c *priv, u8 *buf, int len)
 	return 0;
 }
 
+/* Write a command stream, optionally read @rlen reply data bytes. */
+static int mpsse_cmd(struct ft232h_i2c *priv, const u8 *cmd, int clen,
+		     u8 *reply, int rlen)
+{
+	int ret = ftdi_write(priv, cmd, clen);
+
+	if (ret)
+		return ret;
+	if (rlen)
+		return ftdi_read(priv, reply, rlen);
+	return 0;
+}
+
+static int i2c_start(struct ft232h_i2c *priv)
+{
+	u8 cmd[] = {
+		MPSSE_SET_LOW_BYTE, PIN_SCL | PIN_SDAO, DIR_WRITE, /* both high */
+		MPSSE_SET_LOW_BYTE, PIN_SCL,            DIR_WRITE, /* SDA low   */
+		MPSSE_SET_LOW_BYTE, 0x00,               DIR_WRITE, /* SCL low   */
+	};
+	return mpsse_cmd(priv, cmd, sizeof(cmd), NULL, 0);
+}
+
+static int i2c_stop(struct ft232h_i2c *priv)
+{
+	u8 cmd[] = {
+		MPSSE_SET_LOW_BYTE, 0x00,               DIR_WRITE, /* both low  */
+		MPSSE_SET_LOW_BYTE, PIN_SCL,            DIR_WRITE, /* SCL high  */
+		MPSSE_SET_LOW_BYTE, PIN_SCL | PIN_SDAO, DIR_WRITE, /* SDA high  */
+		MPSSE_SET_LOW_BYTE, PIN_SCL | PIN_SDAO, 0x00,      /* release   */
+	};
+	return mpsse_cmd(priv, cmd, sizeof(cmd), NULL, 0);
+}
+
+static int i2c_write_byte(struct ft232h_i2c *priv, u8 val, bool *ack)
+{
+	u8 reply = 0;
+	int ret;
+	u8 cmd[] = {
+		MPSSE_SET_LOW_BYTE, 0x00, DIR_WRITE,   /* SCL low, drive SDA   */
+		MPSSE_BYTES_OUT_NEG, 0x00, 0x00, val,  /* clock out 1 byte     */
+		MPSSE_SET_LOW_BYTE, 0x00, DIR_READ,    /* release SDA for ACK  */
+		MPSSE_BITS_IN_POS, 0x00,               /* clock in 1 ACK bit   */
+		MPSSE_SEND_IMMEDIATE,
+	};
+
+	ret = mpsse_cmd(priv, cmd, sizeof(cmd), &reply, 1);
+	if (ret)
+		return ret;
+	/* Sub-byte reads land in the MSBs; SDA low (bit clear) == ACK. */
+	*ack = !(reply & 0x80);
+	return 0;
+}
+
+static int i2c_read_byte(struct ft232h_i2c *priv, u8 *val, bool send_ack)
+{
+	u8 reply = 0;
+	int ret;
+	u8 cmd[] = {
+		MPSSE_SET_LOW_BYTE, 0x00, DIR_READ,    /* SCL low, SDA released */
+		MPSSE_BYTES_IN_POS, 0x00, 0x00,        /* clock in 1 byte       */
+		MPSSE_SET_LOW_BYTE, 0x00, DIR_WRITE,   /* drive SDA for ACK bit */
+		MPSSE_BITS_OUT_NEG, 0x00,
+			send_ack ? 0x00 : 0x80,        /* MSB-first: 0=ACK,0x80=NACK */
+		MPSSE_SEND_IMMEDIATE,
+	};
+
+	ret = mpsse_cmd(priv, cmd, sizeof(cmd), &reply, 1);
+	if (ret)
+		return ret;
+	*val = reply;
+	return 0;
+}
+
+static int ft232h_xfer_msg(struct ft232h_i2c *priv, struct i2c_msg *msg)
+{
+	bool ack;
+	int ret, i;
+	u8 addr = (msg->addr << 1) | ((msg->flags & I2C_M_RD) ? 1 : 0);
+
+	ret = i2c_start(priv);
+	if (ret)
+		return ret;
+
+	ret = i2c_write_byte(priv, addr, &ack);
+	if (ret)
+		return ret;
+	if (!ack)
+		return -ENXIO;               /* no device at this address */
+
+	if (msg->flags & I2C_M_RD) {
+		for (i = 0; i < msg->len; i++) {
+			ret = i2c_read_byte(priv, &msg->buf[i],
+					    i != msg->len - 1);
+			if (ret)
+				return ret;
+		}
+	} else {
+		for (i = 0; i < msg->len; i++) {
+			ret = i2c_write_byte(priv, msg->buf[i], &ack);
+			if (ret)
+				return ret;
+			if (!ack)
+				return -EIO;   /* slave NACKed data */
+		}
+	}
+	return 0;
+}
+
+static int ft232h_master_xfer(struct i2c_adapter *adap,
+			      struct i2c_msg *msgs, int num)
+{
+	struct ft232h_i2c *priv = i2c_get_adapdata(adap);
+	int ret = 0, i;
+
+	mutex_lock(&priv->io_lock);
+	for (i = 0; i < num; i++) {
+		ret = ft232h_xfer_msg(priv, &msgs[i]);
+		if (ret)
+			break;
+	}
+	i2c_stop(priv);
+	mutex_unlock(&priv->io_lock);
+
+	return ret ? ret : num;
+}
+
+static u32 ft232h_func(struct i2c_adapter *adap)
+{
+	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
+}
+
+static const struct i2c_algorithm ft232h_algo = {
+	.master_xfer   = ft232h_master_xfer,
+	.functionality = ft232h_func,
+};
+
 static int mpsse_init(struct ft232h_i2c *priv, u32 speed_hz)
 {
 	u16 div;
@@ -215,6 +352,20 @@ static int ft232h_i2c_probe(struct usb_interface *intf,
 		usb_put_dev(priv->udev);
 		return ret;
 	}
+
+	i2c_set_adapdata(&priv->adapter, priv);
+	priv->adapter.owner = THIS_MODULE;
+	priv->adapter.algo = &ft232h_algo;
+	priv->adapter.dev.parent = &intf->dev;
+	strscpy(priv->adapter.name, "FT232H MPSSE I2C",
+		sizeof(priv->adapter.name));
+
+	ret = i2c_add_adapter(&priv->adapter);
+	if (ret) {
+		usb_put_dev(priv->udev);
+		return ret;
+	}
+	dev_info(&intf->dev, "registered %s\n", priv->adapter.name);
 	return 0;
 }
 
@@ -222,6 +373,7 @@ static void ft232h_i2c_disconnect(struct usb_interface *intf)
 {
 	struct ft232h_i2c *priv = usb_get_intfdata(intf);
 
+	i2c_del_adapter(&priv->adapter);
 	usb_set_intfdata(intf, NULL);
 	usb_put_dev(priv->udev);
 	dev_info(&intf->dev, "FT232H disconnected\n");
