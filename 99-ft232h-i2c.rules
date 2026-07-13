@@ -1,0 +1,9 @@
+# Hand the FT232H (0403:6014) from the stock ftdi_sio serial driver to
+# ft232h_i2c. ftdi_sio autoloads and claims the interface first; when it
+# binds, unbind it and bind our I2C driver instead.
+#
+# Install: sudo cp 99-ft232h-i2c.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload
+ACTION=="bind", SUBSYSTEM=="usb", DRIVER=="ftdi_sio", \
+  ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6014", \
+  RUN+="/bin/sh -c 'echo %k > /sys/bus/usb/drivers/ftdi_sio/unbind; echo %k > /sys/bus/usb/drivers/ft232h_i2c/bind'"

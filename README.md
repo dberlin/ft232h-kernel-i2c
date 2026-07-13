@@ -15,15 +15,44 @@ and in-kernel I2C client drivers work normally.
 Add ~4.7 kΩ pull-ups from SCL and SDA to VCC. ADBUS1 and ADBUS2 must be tied
 together (SDA is driven on AD1 and sensed on AD2).
 
-## Build & load
+## Build & load (quick)
 
     make
     sudo insmod ft232h_i2c.ko            # default 100 kHz
     sudo insmod ft232h_i2c.ko speed=400000   # 400 kHz
 
-`ftdi_sio` must not hold the device. If it does:
+## Install (persistent)
 
-    sudo modprobe -r ftdi_sio   # or unbind the specific interface
+Into the running kernel's module tree:
+
+    make
+    sudo make modules_install            # -> /lib/modules/$(uname -r)/updates
+    sudo modprobe ft232h_i2c
+
+### DKMS (auto-rebuild on kernel upgrades, signs with the DKMS MOK)
+
+    sudo cp -r . /usr/src/ft232h_i2c-1.0
+    sudo dkms add    ft232h_i2c/1.0
+    sudo dkms build  ft232h_i2c/1.0
+    sudo dkms install ft232h_i2c/1.0
+
+## The ftdi_sio conflict (important)
+
+The stock `ftdi_sio` serial driver also matches the FT232H (0403:6014) and
+autoloads, claiming the interface before `ft232h_i2c` can. Symptom: the module
+loads but no I2C adapter appears and the interface is bound to `ftdi_sio`.
+
+Install the bundled udev rule to hand the device over automatically (survives
+reboots and replug):
+
+    sudo cp 99-ft232h-i2c.rules /etc/udev/rules.d/
+    sudo udevadm control --reload
+
+One-off manual fix without the rule:
+
+    echo -n 3-4:1.0 | sudo tee /sys/bus/usb/drivers/ftdi_sio/unbind
+    echo -n 3-4:1.0 | sudo tee /sys/bus/usb/drivers/ft232h_i2c/bind
+    # (replace 3-4:1.0 with your device's interface, see: ls /sys/bus/usb/drivers/ftdi_sio/)
 
 ## Use
 
