@@ -164,8 +164,12 @@ static int i2c_write_byte(struct ft232h_i2c *priv, u8 val, bool *ack)
 	ret = mpsse_cmd(priv, cmd, sizeof(cmd), &reply, 1);
 	if (ret)
 		return ret;
-	/* Sub-byte reads land in the MSBs; SDA low (bit clear) == ACK. */
-	*ack = !(reply & 0x80);
+	/*
+	 * A 1-bit MPSSE read shifts the sampled level into bit 0; the upper
+	 * bits are leftover shift-register garbage. SDA low (bit 0 clear) is
+	 * the slave's ACK.
+	 */
+	*ack = !(reply & 0x01);
 	return 0;
 }
 
