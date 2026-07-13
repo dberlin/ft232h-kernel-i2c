@@ -36,23 +36,33 @@ Into the running kernel's module tree:
     sudo dkms build  ft232h_i2c/1.0
     sudo dkms install ft232h_i2c/1.0
 
-## The ftdi_sio conflict (important)
+### Load at boot
+
+    sudo cp ft232h_i2c-modules-load.conf /etc/modules-load.d/ft232h_i2c.conf
+
+## The ftdi_sio conflict
 
 The stock `ftdi_sio` serial driver also matches the FT232H (0403:6014) and
-autoloads, claiming the interface before `ft232h_i2c` can. Symptom: the module
-loads but no I2C adapter appears and the interface is bound to `ftdi_sio`.
+autoloads, usually claiming the interface first.
 
-Install the bundled udev rule to hand the device over automatically (survives
-reboots and replug):
+**The driver handles this itself:** at load time `ft232h_i2c` walks the USB bus
+and, for any FT232H held by another driver, unbinds it and binds itself
+(look for `taking over from ftdi_sio` in `dmesg`). So a plain `modprobe
+ft232h_i2c` (or the boot-load above) is enough — no manual unbinding.
+
+The in-kernel takeover runs once at load, so it does not cover **hot-plugging
+the FT232H while the module is already loaded** (ftdi_sio can grab the fresh
+device). For that case, install the bundled udev rule, which hands the device
+over on every bind:
 
     sudo cp 99-ft232h-i2c.rules /etc/udev/rules.d/
     sudo udevadm control --reload
 
-One-off manual fix without the rule:
+Manual one-off fix (if you ever need it):
 
     echo -n 3-4:1.0 | sudo tee /sys/bus/usb/drivers/ftdi_sio/unbind
     echo -n 3-4:1.0 | sudo tee /sys/bus/usb/drivers/ft232h_i2c/bind
-    # (replace 3-4:1.0 with your device's interface, see: ls /sys/bus/usb/drivers/ftdi_sio/)
+    # (replace 3-4:1.0 with your device's interface; see ls /sys/bus/usb/drivers/ftdi_sio/)
 
 ## Use
 

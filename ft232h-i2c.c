@@ -420,7 +420,54 @@ static struct usb_driver ft232h_i2c_driver = {
 	.probe      = ft232h_i2c_probe,
 	.disconnect = ft232h_i2c_disconnect,
 };
-module_usb_driver(ft232h_i2c_driver);
+
+/*
+ * The stock ftdi_sio serial driver also matches the FT232H and usually binds
+ * first. For each FT232H interface currently held by another driver, release
+ * it and bind ourselves. Called once at module load, after usb_register() has
+ * already claimed any interface that was free.
+ */
+static int ft232h_take_over(struct usb_device *udev, void *unused)
+{
+	struct usb_host_config *cfg = udev->actconfig;
+	struct usb_interface *intf;
+	int i;
+
+	if (le16_to_cpu(udev->descriptor.idVendor) != FT232H_VID ||
+	    le16_to_cpu(udev->descriptor.idProduct) != FT232H_PID || !cfg)
+		return 0;
+
+	for (i = 0; i < cfg->desc.bNumInterfaces; i++) {
+		intf = cfg->interface[i];
+		if (!intf || intf->dev.driver == &ft232h_i2c_driver.driver)
+			continue;
+		if (intf->dev.driver) {
+			dev_info(&intf->dev, "taking over from %s\n",
+				 intf->dev.driver->name);
+			device_release_driver(&intf->dev);
+		}
+		if (device_driver_attach(&ft232h_i2c_driver.driver, &intf->dev))
+			dev_warn(&intf->dev, "could not bind ft232h_i2c\n");
+	}
+	return 0;
+}
+
+static int __init ft232h_i2c_init(void)
+{
+	int ret = usb_register(&ft232h_i2c_driver);
+
+	if (ret)
+		return ret;
+	usb_for_each_dev(NULL, ft232h_take_over);
+	return 0;
+}
+module_init(ft232h_i2c_init);
+
+static void __exit ft232h_i2c_exit(void)
+{
+	usb_deregister(&ft232h_i2c_driver);
+}
+module_exit(ft232h_i2c_exit);
 
 MODULE_AUTHOR("Danny Berlin");
 MODULE_DESCRIPTION("FTDI FT232H I2C master (MPSSE over USB)");
