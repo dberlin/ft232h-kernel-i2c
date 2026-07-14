@@ -31,14 +31,30 @@ Into the running kernel's module tree:
 
 ### DKMS (auto-rebuild on kernel upgrades, signs with the DKMS MOK)
 
-    sudo cp -r . /usr/src/ft232h_i2c-1.0
-    sudo dkms add    ft232h_i2c/1.0
-    sudo dkms build  ft232h_i2c/1.0
+    sudo mkdir -p /usr/src/ft232h_i2c-1.0
+    sudo cp ft232h-i2c.c Makefile dkms.conf /usr/src/ft232h_i2c-1.0/
+    sudo dkms add     ft232h_i2c/1.0
+    sudo dkms build   ft232h_i2c/1.0
     sudo dkms install ft232h_i2c/1.0
+
+Installs to `/lib/modules/<kver>/extra/` (Fedora) and rebuilds on every kernel
+upgrade. On upgrades `dkms.conf` is auto-copied, but if you change the driver
+re-copy the sources above and `dkms remove ft232h_i2c/1.0 --all` before re-adding.
 
 ### Load at boot
 
     sudo cp ft232h_i2c-modules-load.conf /etc/modules-load.d/ft232h_i2c.conf
+
+### Bus speed
+
+The default is 100 kHz. To set it persistently (and document your rig's
+working rate), install the modprobe drop-in and edit the `speed=` value:
+
+    sudo cp ft232h_i2c.conf /etc/modprobe.d/ft232h_i2c.conf
+
+One-off override without the file: `sudo modprobe ft232h_i2c speed=50000`.
+If reads come back corrupt, the bus RC is too slow for the rate — lower
+`speed` or use stronger (~2.2k) pull-ups on shorter wiring.
 
 ## The ftdi_sio conflict
 
