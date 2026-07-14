@@ -48,10 +48,8 @@ struct ft232h_i2c {
 #define MPSSE_READ_LOW_BYTE   0x81  /* returns 1 byte: ADBUS pin states */
 #define MPSSE_BYTES_OUT_NEG   0x11  /* MSB first, out on falling edge */
 #define MPSSE_BYTES_IN_POS    0x20  /* MSB first, in on rising edge */
-#define MPSSE_BYTES_IN_NEG    0x24  /* MSB first, in on falling edge */
 #define MPSSE_BITS_OUT_NEG    0x13  /* MSB first, out on falling edge */
 #define MPSSE_BITS_IN_POS     0x22  /* MSB first, in on rising edge */
-#define MPSSE_BITS_IN_NEG     0x26  /* MSB first, in on falling edge */
 #define MPSSE_SEND_IMMEDIATE  0x87
 #define MPSSE_DIS_DIV5        0x8a
 #define MPSSE_EN_3PHASE       0x8c
