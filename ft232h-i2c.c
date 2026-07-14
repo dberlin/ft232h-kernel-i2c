@@ -27,6 +27,8 @@ struct ft232h_i2c {
 	struct mutex io_lock;
 	u8  *txbuf;
 	u8  *rxbuf;
+	u8  *cmdbuf;    /* assembled MPSSE command stream for one transfer */
+	u8  *replybuf;  /* collected reply bytes for one transfer */
 };
 
 /* FTDI vendor control requests (bRequest) */
@@ -46,8 +48,10 @@ struct ft232h_i2c {
 #define MPSSE_READ_LOW_BYTE   0x81  /* returns 1 byte: ADBUS pin states */
 #define MPSSE_BYTES_OUT_NEG   0x11  /* MSB first, out on falling edge */
 #define MPSSE_BYTES_IN_POS    0x20  /* MSB first, in on rising edge */
+#define MPSSE_BYTES_IN_NEG    0x24  /* MSB first, in on falling edge */
 #define MPSSE_BITS_OUT_NEG    0x13  /* MSB first, out on falling edge */
 #define MPSSE_BITS_IN_POS     0x22  /* MSB first, in on rising edge */
+#define MPSSE_BITS_IN_NEG     0x26  /* MSB first, in on falling edge */
 #define MPSSE_SEND_IMMEDIATE  0x87
 #define MPSSE_DIS_DIV5        0x8a
 #define MPSSE_EN_3PHASE       0x8c
@@ -65,6 +69,20 @@ struct ft232h_i2c {
 
 #define FTDI_USB_TIMEOUT_MS 1000
 
+/* MPSSE command-stream fragment sizes, in bytes emitted per I2C primitive. */
+#define FRAG_START  9
+#define FRAG_STOP   12
+#define FRAG_RW     12   /* one write-byte or read-byte (data + ACK bit) */
+
+/*
+ * Largest transfer we batch into a single bulk-OUT/bulk-IN pair, counted in
+ * reply bytes (one per address or data byte). The command buffer is sized for
+ * the worst case where every reply byte carries its own START.
+ */
+#define FT232H_MAX_REPLY  256
+#define FT232H_CMD_CAP    (FT232H_MAX_REPLY * (FRAG_RW + FRAG_START) + \
+			   FRAG_STOP + 1)
+
 static int ftdi_ctrl(struct ft232h_i2c *priv, u8 request, u16 value)
 {
 	return usb_control_msg(priv->udev, usb_sndctrlpipe(priv->udev, 0),
@@ -74,19 +92,32 @@ static int ftdi_ctrl(struct ft232h_i2c *priv, u8 request, u16 value)
 			       FTDI_USB_TIMEOUT_MS);
 }
 
+/*
+ * Send an MPSSE command stream of arbitrary length. The chip concatenates
+ * successive bulk-OUT transfers into its command FIFO, so splitting a long
+ * stream across chunks is safe (a write->write boundary does not race the
+ * MPSSE engine the way a read->write boundary does).
+ */
 static int ftdi_write(struct ft232h_i2c *priv, const u8 *buf, int len)
 {
-	int ret, actual;
+	int off = 0;
 
-	if (len > 512)
-		return -EINVAL;
-	memcpy(priv->txbuf, buf, len);
-	ret = usb_bulk_msg(priv->udev,
-			   usb_sndbulkpipe(priv->udev, priv->ep_out),
-			   priv->txbuf, len, &actual, FTDI_USB_TIMEOUT_MS);
-	if (ret)
-		return ret;
-	return actual == len ? 0 : -EIO;
+	while (off < len) {
+		int chunk = min(len - off, 512);
+		int ret, actual;
+
+		memcpy(priv->txbuf, buf + off, chunk);
+		ret = usb_bulk_msg(priv->udev,
+				   usb_sndbulkpipe(priv->udev, priv->ep_out),
+				   priv->txbuf, chunk, &actual,
+				   FTDI_USB_TIMEOUT_MS);
+		if (ret)
+			return ret;
+		if (actual != chunk)
+			return -EIO;
+		off += chunk;
+	}
+	return 0;
 }
 
 /* Read exactly @len MPSSE data bytes; strip 2 modem-status bytes per packet. */
@@ -115,141 +146,159 @@ static int ftdi_read(struct ft232h_i2c *priv, u8 *buf, int len)
 	return 0;
 }
 
-/* Write a command stream, optionally read @rlen reply data bytes. */
-static int mpsse_cmd(struct ft232h_i2c *priv, const u8 *cmd, int clen,
-		     u8 *reply, int rlen)
-{
-	int ret = ftdi_write(priv, cmd, clen);
+/*
+ * Command-stream builder. An entire I2C transfer (every START, address, data
+ * byte and its ACK, plus the final STOP) is assembled into one MPSSE command
+ * buffer, sent with a single bulk-OUT, and its replies collected with a single
+ * bulk-IN. Doing one byte per USB round-trip instead raced the MPSSE engine:
+ * issuing a command bulk-OUT immediately after the previous reply's bulk-IN
+ * occasionally dropped the leading command byte, desyncing the transfer and
+ * returning stale shift-register data. Batching removes that read->write
+ * boundary from inside a transfer entirely.
+ */
+struct i2c_cmdbuf {
+	u8  *buf;
+	int  len;
+	int  nreply;   /* reply bytes the chip will produce for this stream */
+};
 
-	if (ret)
-		return ret;
-	if (rlen)
-		return ftdi_read(priv, reply, rlen);
-	return 0;
+static void emit(struct i2c_cmdbuf *c, const u8 *b, int n)
+{
+	memcpy(c->buf + c->len, b, n);
+	c->len += n;
 }
 
-static int i2c_start(struct ft232h_i2c *priv)
+static void emit_start(struct i2c_cmdbuf *c)
 {
-	u8 cmd[] = {
+	static const u8 s[FRAG_START] = {
 		MPSSE_SET_LOW_BYTE, PIN_SCL | PIN_SDAO, DIR_WRITE, /* both high */
 		MPSSE_SET_LOW_BYTE, PIN_SCL,            DIR_WRITE, /* SDA low   */
 		MPSSE_SET_LOW_BYTE, 0x00,               DIR_WRITE, /* SCL low   */
 	};
-	return mpsse_cmd(priv, cmd, sizeof(cmd), NULL, 0);
+	emit(c, s, sizeof(s));
 }
 
-static int i2c_stop(struct ft232h_i2c *priv)
+static void emit_stop(struct i2c_cmdbuf *c)
 {
-	u8 cmd[] = {
+	static const u8 s[FRAG_STOP] = {
 		MPSSE_SET_LOW_BYTE, 0x00,               DIR_WRITE, /* both low  */
 		MPSSE_SET_LOW_BYTE, PIN_SCL,            DIR_WRITE, /* SCL high  */
 		MPSSE_SET_LOW_BYTE, PIN_SCL | PIN_SDAO, DIR_WRITE, /* SDA high  */
 		MPSSE_SET_LOW_BYTE, PIN_SCL | PIN_SDAO, 0x00,      /* release   */
 	};
-	return mpsse_cmd(priv, cmd, sizeof(cmd), NULL, 0);
+	emit(c, s, sizeof(s));
 }
 
-static int i2c_write_byte(struct ft232h_i2c *priv, u8 val, bool *ack)
+/* Clock out one byte, release SDA, then clock in the slave's ACK bit. */
+static void emit_write_byte(struct i2c_cmdbuf *c, u8 val)
 {
-	u8 reply = 0;
-	int ret;
-	u8 cmd[] = {
+	u8 s[FRAG_RW] = {
 		MPSSE_SET_LOW_BYTE, 0x00, DIR_WRITE,   /* SCL low, drive SDA   */
 		MPSSE_BYTES_OUT_NEG, 0x00, 0x00, val,  /* clock out 1 byte     */
 		MPSSE_SET_LOW_BYTE, 0x00, DIR_READ,    /* release SDA for ACK  */
 		MPSSE_BITS_IN_POS, 0x00,               /* clock in 1 ACK bit   */
-		MPSSE_SEND_IMMEDIATE,
 	};
-
-	ret = mpsse_cmd(priv, cmd, sizeof(cmd), &reply, 1);
-	if (ret)
-		return ret;
-	/*
-	 * A 1-bit MPSSE read shifts the sampled level into bit 0; the upper
-	 * bits are leftover shift-register garbage. SDA low (bit 0 clear) is
-	 * the slave's ACK.
-	 */
-	*ack = !(reply & 0x01);
-	return 0;
+	emit(c, s, sizeof(s));
+	c->nreply++;
 }
 
-static int i2c_read_byte(struct ft232h_i2c *priv, u8 *val, bool send_ack)
+/* Clock in one byte, then drive the master's ACK (0) or NACK (1) bit. */
+static void emit_read_byte(struct i2c_cmdbuf *c, bool send_ack)
 {
-	u8 reply = 0;
-	int ret;
-	u8 cmd[] = {
+	u8 s[FRAG_RW] = {
 		MPSSE_SET_LOW_BYTE, 0x00, DIR_READ,    /* SCL low, SDA released */
 		MPSSE_BYTES_IN_POS, 0x00, 0x00,        /* clock in 1 byte       */
 		MPSSE_SET_LOW_BYTE, 0x00, DIR_WRITE,   /* drive SDA for ACK bit */
 		MPSSE_BITS_OUT_NEG, 0x00,
-			send_ack ? 0x00 : 0x80,        /* MSB-first: 0=ACK,0x80=NACK */
-		MPSSE_SEND_IMMEDIATE,
+			send_ack ? 0x00 : 0x80,        /* MSB-first: 0=ACK, 0x80=NACK */
 	};
-
-	ret = mpsse_cmd(priv, cmd, sizeof(cmd), &reply, 1);
-	if (ret)
-		return ret;
-	*val = reply;
-	return 0;
-}
-
-static int ft232h_xfer_msg(struct ft232h_i2c *priv, struct i2c_msg *msg)
-{
-	bool ack;
-	int ret, i;
-	u8 addr = (msg->addr << 1) | ((msg->flags & I2C_M_RD) ? 1 : 0);
-
-	ret = i2c_start(priv);
-	if (ret)
-		return ret;
-
-	ret = i2c_write_byte(priv, addr, &ack);
-	if (ret)
-		return ret;
-	if (!ack)
-		return -ENXIO;               /* no device at this address */
-
-	if (msg->flags & I2C_M_RD) {
-		for (i = 0; i < msg->len; i++) {
-			ret = i2c_read_byte(priv, &msg->buf[i],
-					    i != msg->len - 1);
-			if (ret)
-				return ret;
-		}
-	} else {
-		for (i = 0; i < msg->len; i++) {
-			ret = i2c_write_byte(priv, msg->buf[i], &ack);
-			if (ret)
-				return ret;
-			if (!ack)
-				return -EIO;   /* slave NACKed data */
-		}
-	}
-	return 0;
+	emit(c, s, sizeof(s));
+	c->nreply++;
 }
 
 static int ft232h_master_xfer(struct i2c_adapter *adap,
 			      struct i2c_msg *msgs, int num)
 {
 	struct ft232h_i2c *priv = i2c_get_adapdata(adap);
-	int ret = 0, i;
+	struct i2c_cmdbuf c = { .buf = priv->cmdbuf };
+	u8 send_imm = MPSSE_SEND_IMMEDIATE;
+	int ret, i, j, ridx, need = 0;
+
+	/* Whole transfer must fit our command/reply buffers (one bulk-IN). */
+	for (i = 0; i < num; i++)
+		need += 1 + msgs[i].len;        /* address + payload = replies */
+	if (need > FT232H_MAX_REPLY)
+		return -EINVAL;
 
 	mutex_lock(&priv->io_lock);
-	for (i = 0; i < num; i++) {
-		ret = ft232h_xfer_msg(priv, &msgs[i]);
-		if (ret)
-			break;
-	}
-	i2c_stop(priv);
-	mutex_unlock(&priv->io_lock);
 
-	return ret ? ret : num;
+	/* Assemble the entire transfer as one command stream. */
+	for (i = 0; i < num; i++) {
+		struct i2c_msg *m = &msgs[i];
+		u8 addr = (m->addr << 1) | ((m->flags & I2C_M_RD) ? 1 : 0);
+
+		emit_start(&c);
+		emit_write_byte(&c, addr);
+		if (m->flags & I2C_M_RD)
+			for (j = 0; j < m->len; j++)
+				emit_read_byte(&c, j != m->len - 1);
+		else
+			for (j = 0; j < m->len; j++)
+				emit_write_byte(&c, m->buf[j]);
+	}
+	emit_stop(&c);
+	emit(&c, &send_imm, 1);
+
+	ret = ftdi_write(priv, c.buf, c.len);
+	if (ret)
+		goto out;
+	ret = ftdi_read(priv, priv->replybuf, c.nreply);
+	if (ret)
+		goto out;
+
+	/*
+	 * Replies arrive in emission order, one byte per address/data byte.
+	 * A 1-bit ACK read lands in bit 0 (upper bits are shift-register
+	 * garbage); bit 0 clear means the slave ACKed.
+	 */
+	ridx = 0;
+	for (i = 0; i < num; i++) {
+		struct i2c_msg *m = &msgs[i];
+
+		if (priv->replybuf[ridx++] & 0x01) {   /* address NAKed */
+			ret = -ENXIO;
+			goto out;
+		}
+		if (m->flags & I2C_M_RD) {
+			for (j = 0; j < m->len; j++)
+				m->buf[j] = priv->replybuf[ridx++];
+		} else {
+			for (j = 0; j < m->len; j++)
+				if (priv->replybuf[ridx++] & 0x01) {
+					ret = -EIO;    /* slave NAKed data */
+					goto out;
+				}
+		}
+	}
+	ret = num;
+out:
+	mutex_unlock(&priv->io_lock);
+	return ret;
 }
 
 static u32 ft232h_func(struct i2c_adapter *adap)
 {
 	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
 }
+
+/*
+ * Cap a single message so its address byte plus payload fit the reply buffer;
+ * the core splits larger reads/writes into multiple transfers for us.
+ */
+static const struct i2c_adapter_quirks ft232h_quirks = {
+	.max_read_len  = FT232H_MAX_REPLY - 1,
+	.max_write_len = FT232H_MAX_REPLY - 1,
+};
 
 static const struct i2c_algorithm ft232h_algo = {
 	.master_xfer   = ft232h_master_xfer,
@@ -273,6 +322,11 @@ static int mpsse_init(struct ft232h_i2c *priv, u32 speed_hz)
 
 	if (speed_hz == 0 || speed_hz > 20000000)
 		return -EINVAL;
+	/*
+	 * TCK = 30MHz / (1 + div); 3-phase clocking then stretches each bit to
+	 * 1.5 TCK periods, so SCL = TCK / 1.5. This divisor already targets
+	 * TCK = 1.5 * speed, i.e. SCL = speed.
+	 */
 	div = (20000000 / speed_hz) - 1;
 	cfg[5] = div & 0xff;
 	cfg[6] = (div >> 8) & 0xff;
@@ -365,7 +419,9 @@ static int ft232h_i2c_probe(struct usb_interface *intf,
 
 	priv->txbuf = devm_kmalloc(&intf->dev, 512, GFP_KERNEL);
 	priv->rxbuf = devm_kmalloc(&intf->dev, priv->maxpacket, GFP_KERNEL);
-	if (!priv->txbuf || !priv->rxbuf) {
+	priv->cmdbuf = devm_kmalloc(&intf->dev, FT232H_CMD_CAP, GFP_KERNEL);
+	priv->replybuf = devm_kmalloc(&intf->dev, FT232H_MAX_REPLY, GFP_KERNEL);
+	if (!priv->txbuf || !priv->rxbuf || !priv->cmdbuf || !priv->replybuf) {
 		usb_put_dev(priv->udev);
 		return -ENOMEM;
 	}
@@ -385,6 +441,7 @@ static int ft232h_i2c_probe(struct usb_interface *intf,
 	i2c_set_adapdata(&priv->adapter, priv);
 	priv->adapter.owner = THIS_MODULE;
 	priv->adapter.algo = &ft232h_algo;
+	priv->adapter.quirks = &ft232h_quirks;
 	priv->adapter.dev.parent = &intf->dev;
 	strscpy(priv->adapter.name, "FT232H MPSSE I2C",
 		sizeof(priv->adapter.name));
